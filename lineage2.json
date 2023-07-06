@@ -1,0 +1,84 @@
+{
+  "lineageid": "simple_json_test",
+  "Source_data": {
+    "system": "Databricks",
+    "database": "oracle",
+    "schema": "customer",
+    "table": [
+      {
+        "name": "customer_ext",
+        "parentLineageId": "custormsource",
+        "column": [
+          {
+            "name": "CustomerName",
+            "type": "String",
+            "Source": "customer_ext"
+          },
+          {
+            "name": "CustomerAddress",
+            "type": "String",
+            "Source": "customer_ext"
+          },
+          {
+            "name": "CustomerType",
+            "type": "String",
+            "Source": "customer_ext"
+          }
+        ]
+      },
+      {
+        "name": "account",
+        "parentLineageId": "accountsource",
+        "column": [
+          {
+            "name": "CustomerName",
+            "type": "String",
+            "Source": "account"
+          },
+          {
+            "name": "accounttype",
+            "type": "String",
+            "source": "account"
+          }
+        ]
+      }
+    ]
+  },
+  "Target_data": {
+    "system": "Databricks",
+    "database": "oracle",
+    "schema": "customer",
+    "table": "customer_dim",
+    "column": [
+      {
+        "name": "CustomerName",
+        "type": "String",
+        "transformation type": "direct",
+        "transformation": "direct",
+        "transformation_desc": "direct",
+        "Source_Table": "customer_ext",
+        "Source_Col_Name": "CustomerName"
+      },
+      {
+        "name": "CustomerAddress",
+        "type": "String",
+        "transformation type": "direct",
+        "transformation": "direct",
+        "transformation_desc": "direct",
+        "Source_Table": "customer_ext",
+        "Source_Col_Name": "CustomerAddress"
+      },
+      {
+        "name": "accounttype",
+        "type": "String",
+        "transformation type": "direct",
+        "transformation": "direct",
+        "transformation_desc": "direct",
+        "Source_Table": "account",
+        "Source_Col_Name": "accounttype"
+      }
+    ]
+  },
+  "mapping": "customer_dim",
+  "source_code": "insert into customer_dim (CustomerName,CustomerAddress,accounttype) select a.CustomerAddress,a.CustomerAddress,b.accounttype from customer_ext a INNER JOIN account b ON a.CustomerName=b.CustomerName"
+}
