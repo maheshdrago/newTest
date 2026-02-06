@@ -1,0 +1,66 @@
+# ─────────────────────────────────────────────────────────────
+#  Docker Compose — full production stack
+#
+#  Services:
+#    app   — Node.js WebSocket + HTTP server
+#    nginx — Reverse proxy (TLS termination, caching, WS upgrade)
+# ─────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+  # ── Node.js Application ──────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: chainlit-app
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_PATH=/app/data/chainlit.db
+      - AI_PROVIDER_URL=${AI_PROVIDER_URL:-https://api.openai.com/v1}
+      - AI_API_KEY=${AI_API_KEY}
+      - AI_MODEL=${AI_MODEL:-gpt-4o-mini}
+      - SESSION_SECRET=${SESSION_SECRET:-change-me-in-production}
+      - SESSION_TTL_HOURS=72
+      - RATE_LIMIT_POINTS=30
+      - RATE_LIMIT_DURATION_SECONDS=60
+      - WS_HEARTBEAT_INTERVAL_MS=30000
+      - WS_MAX_PAYLOAD_BYTES=65536
+    volumes:
+      # Persist SQLite database across container restarts
+      - app_data:/app/data
+    networks:
+      - internal
+    # Not exposed directly — Nginx fronts it
+    expose:
+      - "3000"
+
+  # ── Nginx Reverse Proxy ──────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: chainlit-nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_PORT:-80}:80"
+      # Uncomment for TLS:
+      # - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Uncomment for TLS certs:
+      # - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - app
+    networks:
+      - internal
+
+volumes:
+  app_data:
+    driver: local
+
+networks:
+  internal:
+    driver: bridge
