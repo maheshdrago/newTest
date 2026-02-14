@@ -54,14 +54,24 @@ export class NotificationService {
   }
 
   async getNotifications(userId: string, limit = 50, offset = 0): Promise<Notification[]> {
-    // For now, notifications are event-driven and delivered via WebSocket in real-time.
-    // This would query a notifications table if we add one in a future migration.
-    return [];
+    return db('notifications')
+      .where({ user_id: userId })
+      .orderBy('created_at', 'desc')
+      .limit(limit)
+      .offset(offset);
   }
 
-  async markAsRead(userId: string, notificationId: string): Promise<void> {
-    // Would update the notification record in DB
-    logger.info('Notification marked as read', { userId, notificationId });
+  async markAsRead(userId: string, notificationId: string): Promise<boolean> {
+    const updated = await db('notifications')
+      .where({ id: notificationId, user_id: userId })
+      .update({ is_read: true, updated_at: new Date() });
+    return updated > 0;
+  }
+
+  async markAllAsRead(userId: string): Promise<number> {
+    return db('notifications')
+      .where({ user_id: userId, is_read: false })
+      .update({ is_read: true, updated_at: new Date() });
   }
 }
 

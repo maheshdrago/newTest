@@ -10,6 +10,7 @@ import { logger } from '../../../core/logger';
 import { eventBus } from '../../../core/events';
 import { DeploymentRepository } from '../../database/repositories/deployment.repository';
 import { ProjectRepository } from '../../database/repositories/project.repository';
+import { safePath, sanitizeForShell } from '../../../core/security/sanitize';
 
 const execAsync = promisify(exec);
 
@@ -26,6 +27,10 @@ async function processDeployment(job: Job<DeploymentJobData>): Promise<{ url: st
   const deployRepo = new DeploymentRepository();
   const projectRepo = new ProjectRepository();
 
+  // Sanitize IDs for safe use in shell commands
+  const safeDeploymentId = sanitizeForShell(deploymentId);
+  const safeProjectId = sanitizeForShell(projectId);
+
   logger.info('Processing deployment', { deploymentId, projectId, version });
 
   try {
@@ -40,12 +45,12 @@ async function processDeployment(job: Job<DeploymentJobData>): Promise<{ url: st
     await deployRepo.appendLog(deploymentId, `Found ${files.length} files`);
     await job.updateProgress(20);
 
-    // 3. Write files to temporary build directory
-    const buildDir = path.join(os.tmpdir(), 'buildcraft', `deploy-${deploymentId}`);
+    // 3. Write files to temporary build directory (with path traversal protection)
+    const buildDir = path.join(os.tmpdir(), 'buildcraft', `deploy-${safeDeploymentId}`);
     await mkdir(buildDir, { recursive: true });
 
     for (const file of files) {
-      const filePath = path.join(buildDir, file.path);
+      const filePath = safePath(buildDir, file.path);
       await mkdir(path.dirname(filePath), { recursive: true });
       await writeFile(filePath, file.content, 'utf-8');
     }
@@ -59,8 +64,8 @@ async function processDeployment(job: Job<DeploymentJobData>): Promise<{ url: st
     await deployRepo.appendLog(deploymentId, 'Dockerfile generated');
     await job.updateProgress(40);
 
-    // 5. Build Docker image
-    const imageName = `buildcraft-app-${projectId}:v${version}`;
+    // 5. Build Docker image (sanitized image name)
+    const imageName = `buildcraft-app-${safeProjectId}:v${version}`;
     await deployRepo.update(deploymentId, { status: 'building' } as any);
     await deployRepo.appendLog(deploymentId, `Building Docker image: ${imageName}`);
 
@@ -68,17 +73,25 @@ async function processDeployment(job: Job<DeploymentJobData>): Promise<{ url: st
       `docker build -t ${imageName} --no-cache .`,
       { cwd: buildDir, timeout: 300000 } // 5 min timeout
     );
-    logger.info('Docker build output', { deploymentId, output: buildOutput.slice(-500) });
+    logger.info('Docker build completed', { deploymentId });
     await deployRepo.appendLog(deploymentId, 'Docker image built successfully');
     await job.updateProgress(70);
 
-    // 6. Run container
+    // 6. Run container — sanitize env vars (only allow safe values)
     await deployRepo.update(deploymentId, { status: 'deploying' } as any);
-    const envFlags = Object.entries(environment).map(([k, v]) => `-e ${k}=${v}`).join(' ');
-    const { stdout: containerId } = await execAsync(
-      `docker run -d --restart unless-stopped --network buildcraft-net ${envFlags} ${imageName}`,
-      { timeout: 60000 }
-    );
+    const envFlags = Object.entries(environment)
+      .filter(([k]) => /^[A-Z_][A-Z0-9_]*$/i.test(k)) // Only allow valid env var names
+      .map(([k, v]) => ['-e', `${k}=${v}`])
+      .flat();
+
+    const runArgs = [
+      'docker', 'run', '-d',
+      '--restart', 'unless-stopped',
+      '--network', 'buildcraft-net',
+      ...envFlags,
+      imageName,
+    ];
+    const { stdout: containerId } = await execAsync(runArgs.join(' '), { timeout: 60000 });
     const trimmedContainerId = containerId.trim();
     await deployRepo.appendLog(deploymentId, `Container started: ${trimmedContainerId.slice(0, 12)}`);
     await job.updateProgress(85);
@@ -89,7 +102,7 @@ async function processDeployment(job: Job<DeploymentJobData>): Promise<{ url: st
       { timeout: 10000 }
     );
     const port = portOutput.trim().split(':').pop();
-    const url = `https://${projectId.slice(0, 8)}.buildcraft.app`;
+    const url = `https://${safeProjectId.slice(0, 8)}.buildcraft.app`;
     await job.updateProgress(95);
 
     // 8. Update deployment as live

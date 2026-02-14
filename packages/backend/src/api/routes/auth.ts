@@ -3,10 +3,11 @@ import { authService } from '../../services/auth';
 import { validate } from '../middlewares/validate';
 import { loginSchema, registerSchema, refreshTokenSchema } from '../validators/auth';
 import { authenticate, AuthenticatedRequest } from '../middlewares/auth';
+import { authRateLimiter } from '../../patterns/rate-limiter';
 
 const router = Router();
 
-router.post('/register', validate(registerSchema), async (req: Request, res: Response) => {
+router.post('/register', authRateLimiter, validate(registerSchema), async (req: Request, res: Response) => {
   const { name, email, password } = req.body;
   const result = await authService.register(name, email, password, {
     ip: req.ip,
@@ -15,7 +16,7 @@ router.post('/register', validate(registerSchema), async (req: Request, res: Res
   res.status(201).json({ success: true, data: result });
 });
 
-router.post('/login', validate(loginSchema), async (req: Request, res: Response) => {
+router.post('/login', authRateLimiter, validate(loginSchema), async (req: Request, res: Response) => {
   const { email, password } = req.body;
   const result = await authService.login(email, password, {
     ip: req.ip,

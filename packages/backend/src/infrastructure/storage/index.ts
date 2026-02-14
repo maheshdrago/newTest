@@ -4,6 +4,7 @@ import { writeFile, readFile, unlink, mkdir } from 'fs/promises';
 import path from 'path';
 import { config } from '../../core/config';
 import { logger } from '../../core/logger';
+import { safePath } from '../../core/security/sanitize';
 
 export interface StorageFile {
   key: string;
@@ -87,7 +88,8 @@ class LocalStorageProvider implements StorageProvider {
   }
 
   async put(file: StorageFile): Promise<string> {
-    const filePath = path.join(this.basePath, file.key);
+    // Path traversal protection: validate key stays within basePath
+    const filePath = safePath(this.basePath, file.key);
     await mkdir(path.dirname(filePath), { recursive: true });
     const content = typeof file.content === 'string' ? file.content : file.content;
     await writeFile(filePath, content);
@@ -96,18 +98,19 @@ class LocalStorageProvider implements StorageProvider {
   }
 
   async get(key: string): Promise<Buffer> {
-    const filePath = path.join(this.basePath, key);
+    const filePath = safePath(this.basePath, key);
     return readFile(filePath);
   }
 
   async delete(key: string): Promise<void> {
-    const filePath = path.join(this.basePath, key);
+    const filePath = safePath(this.basePath, key);
     await unlink(filePath);
   }
 
   async list(prefix: string): Promise<string[]> {
     const { glob } = await import('glob');
-    const pattern = path.join(this.basePath, prefix, '**/*');
+    const safePrefix = safePath(this.basePath, prefix);
+    const pattern = path.join(safePrefix, '**/*');
     const files = await glob(pattern, { nodir: true });
     return files.map((f) => path.relative(this.basePath, f));
   }

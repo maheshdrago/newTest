@@ -7,6 +7,7 @@ import os from 'os';
 import { createWorker } from '../connection';
 import { QUEUE_NAMES } from '../queues';
 import { logger } from '../../../core/logger';
+import { safePath, sanitizeForShell } from '../../../core/security/sanitize';
 
 const execAsync = promisify(exec);
 
@@ -35,7 +36,10 @@ const MAX_CPUS = '0.5';
 async function processSandboxExecution(job: Job<SandboxJobData>): Promise<SandboxResult> {
   const { sandboxId, projectId, files, framework } = job.data;
   const logs: string[] = [];
-  const sandboxDir = path.join(os.tmpdir(), 'buildcraft', 'sandbox', sandboxId);
+
+  // Sanitize IDs for safe use in shell commands and Docker names
+  const safeSandboxId = sanitizeForShell(sandboxId);
+  const sandboxDir = path.join(os.tmpdir(), 'buildcraft', 'sandbox', safeSandboxId);
 
   try {
     // 1. Create isolated filesystem
@@ -43,9 +47,9 @@ async function processSandboxExecution(job: Job<SandboxJobData>): Promise<Sandbo
     logs.push('Created sandbox directory');
     await job.updateProgress(10);
 
-    // 2. Write project files
+    // 2. Write project files (with path traversal protection)
     for (const file of files) {
-      const filePath = path.join(sandboxDir, file.path);
+      const filePath = safePath(sandboxDir, file.path);
       await mkdir(path.dirname(filePath), { recursive: true });
       await writeFile(filePath, file.content, 'utf-8');
     }
@@ -64,7 +68,7 @@ async function processSandboxExecution(job: Job<SandboxJobData>): Promise<Sandbo
     // 4. Build Docker image with resource limits
     const dockerfilePath = path.join(sandboxDir, 'Dockerfile.sandbox');
     await writeFile(dockerfilePath, getSandboxDockerfile(framework), 'utf-8');
-    const imageName = `buildcraft-sandbox-${sandboxId}`;
+    const imageName = `buildcraft-sandbox-${safeSandboxId}`;
 
     await execAsync(`docker build -t ${imageName} -f Dockerfile.sandbox .`, {
       cwd: sandboxDir,
@@ -74,9 +78,10 @@ async function processSandboxExecution(job: Job<SandboxJobData>): Promise<Sandbo
     await job.updateProgress(60);
 
     // 5. Run container with strict resource limits and network isolation
+    const containerName = `sandbox-${safeSandboxId}`;
     const { stdout: containerId } = await execAsync(
       `docker run -d \
-        --name sandbox-${sandboxId} \
+        --name ${containerName} \
         --memory=${MAX_MEMORY} \
         --cpus=${MAX_CPUS} \
         --network=${SANDBOX_NETWORK} \
@@ -93,7 +98,7 @@ async function processSandboxExecution(job: Job<SandboxJobData>): Promise<Sandbo
     await job.updateProgress(80);
 
     // 6. Get mapped port
-    const { stdout: portOutput } = await execAsync(`docker port sandbox-${sandboxId} 3000`, { timeout: 5000 });
+    const { stdout: portOutput } = await execAsync(`docker port ${containerName} 3000`, { timeout: 5000 });
     const port = parseInt(portOutput.trim().split(':').pop() || '0');
     const url = `http://localhost:${port}`;
     logs.push(`Preview available at ${url}`);
@@ -102,11 +107,11 @@ async function processSandboxExecution(job: Job<SandboxJobData>): Promise<Sandbo
     // 7. Set auto-cleanup timer (sandbox auto-destroys after timeout)
     setTimeout(async () => {
       try {
-        await execAsync(`docker rm -f sandbox-${sandboxId}`);
+        await execAsync(`docker rm -f ${containerName}`);
         await rm(sandboxDir, { recursive: true, force: true });
-        logger.info('Sandbox cleaned up', { sandboxId });
+        logger.info('Sandbox cleaned up', { sandboxId: safeSandboxId });
       } catch (e) {
-        logger.warn('Sandbox cleanup failed', { sandboxId, error: (e as Error).message });
+        logger.warn('Sandbox cleanup failed', { sandboxId: safeSandboxId, error: (e as Error).message });
       }
     }, SANDBOX_TIMEOUT);
 
@@ -117,7 +122,7 @@ async function processSandboxExecution(job: Job<SandboxJobData>): Promise<Sandbo
     logs.push(`Error: ${error.message}`);
     // Cleanup on failure
     try {
-      await execAsync(`docker rm -f sandbox-${sandboxId}`).catch(() => {});
+      await execAsync(`docker rm -f sandbox-${safeSandboxId}`).catch(() => {});
       await rm(sandboxDir, { recursive: true, force: true }).catch(() => {});
     } catch (e) { /* ignore cleanup errors */ }
     return { sandboxId, containerId: '', url: '', port: 0, status: 'failed', logs };

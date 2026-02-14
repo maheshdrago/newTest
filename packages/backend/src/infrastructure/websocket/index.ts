@@ -6,14 +6,23 @@ import jwt from 'jsonwebtoken';
 import { config } from '../../core/config';
 import { logger } from '../../core/logger';
 import { eventBus } from '../../core/events';
+import { sanitizeHtml } from '../../core/security/sanitize';
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
   userName?: string;
 }
 
+const MAX_MESSAGE_LENGTH = 10000;
+const MAX_FILE_CONTENT_LENGTH = 500000; // 500KB per file change
+const MAX_PROJECT_ID_LENGTH = 64;
+
+// Singleton instance for access from health checks etc.
+let wsManagerInstance: WebSocketManager | null = null;
+
 export class WebSocketManager {
   private io: Server;
+  private connectedClients = 0;
 
   constructor(httpServer: HttpServer) {
     this.io = new Server(httpServer, {
@@ -21,12 +30,15 @@ export class WebSocketManager {
       transports: ['websocket', 'polling'],
       pingInterval: 25000,
       pingTimeout: 20000,
+      maxHttpBufferSize: 1e6, // 1MB max payload to prevent DoS
     });
 
     this.setupRedisAdapter();
     this.setupAuthentication();
     this.setupEventHandlers();
     this.setupEventBusForwarding();
+
+    wsManagerInstance = this;
   }
 
   private async setupRedisAdapter(): Promise<void> {
@@ -70,12 +82,15 @@ export class WebSocketManager {
 
   private setupEventHandlers(): void {
     this.io.on('connection', (socket: AuthenticatedSocket) => {
+      this.connectedClients++;
       logger.info('Client connected', { socketId: socket.id, userId: socket.userId });
 
       // Join project room
       socket.on('join-project', async (projectId: string) => {
+        if (typeof projectId !== 'string' || projectId.length > MAX_PROJECT_ID_LENGTH) {
+          return socket.emit('error', { message: 'Invalid project ID' });
+        }
         await socket.join(`project:${projectId}`);
-        // Broadcast presence to room
         this.io.to(`project:${projectId}`).emit('user-joined', {
           userId: socket.userId,
           userName: socket.userName,
@@ -87,6 +102,7 @@ export class WebSocketManager {
 
       // Leave project room
       socket.on('leave-project', async (projectId: string) => {
+        if (typeof projectId !== 'string' || projectId.length > MAX_PROJECT_ID_LENGTH) return;
         await socket.leave(`project:${projectId}`);
         this.io.to(`project:${projectId}`).emit('user-left', {
           userId: socket.userId,
@@ -96,6 +112,11 @@ export class WebSocketManager {
 
       // File change broadcast (operational transform-ready)
       socket.on('file-change', (data: { projectId: string; path: string; content: string; cursorPosition?: any }) => {
+        if (!data || typeof data !== 'object') return;
+        if (typeof data.projectId !== 'string' || data.projectId.length > MAX_PROJECT_ID_LENGTH) return;
+        if (typeof data.path !== 'string' || data.path.length > 500) return;
+        if (typeof data.content !== 'string' || data.content.length > MAX_FILE_CONTENT_LENGTH) return;
+
         socket.to(`project:${data.projectId}`).emit('file-changed', {
           ...data,
           userId: socket.userId,
@@ -106,6 +127,11 @@ export class WebSocketManager {
 
       // Cursor position broadcast
       socket.on('cursor-move', (data: { projectId: string; path: string; position: { line: number; column: number } }) => {
+        if (!data || typeof data !== 'object') return;
+        if (typeof data.projectId !== 'string' || data.projectId.length > MAX_PROJECT_ID_LENGTH) return;
+        if (typeof data.path !== 'string' || data.path.length > 500) return;
+        if (!data.position || typeof data.position.line !== 'number' || typeof data.position.column !== 'number') return;
+
         socket.to(`project:${data.projectId}`).emit('cursor-moved', {
           ...data,
           userId: socket.userId,
@@ -113,11 +139,15 @@ export class WebSocketManager {
         });
       });
 
-      // Chat message in project
+      // Chat message in project — sanitize content to prevent XSS
       socket.on('chat-message', (data: { projectId: string; content: string }) => {
+        if (!data || typeof data !== 'object') return;
+        if (typeof data.projectId !== 'string' || data.projectId.length > MAX_PROJECT_ID_LENGTH) return;
+        if (typeof data.content !== 'string' || data.content.length === 0 || data.content.length > MAX_MESSAGE_LENGTH) return;
+
         this.io.to(`project:${data.projectId}`).emit('chat-message', {
           id: `msg_${Date.now()}_${socket.id}`,
-          content: data.content,
+          content: sanitizeHtml(data.content),
           userId: socket.userId,
           userName: socket.userName,
           timestamp: new Date(),
@@ -126,8 +156,8 @@ export class WebSocketManager {
 
       // Disconnect
       socket.on('disconnect', (reason) => {
+        this.connectedClients--;
         logger.info('Client disconnected', { socketId: socket.id, userId: socket.userId, reason });
-        // Notify all rooms this socket was in
         socket.rooms.forEach((room) => {
           if (room.startsWith('project:')) {
             this.io.to(room).emit('user-left', { userId: socket.userId, timestamp: new Date() });
@@ -177,4 +207,16 @@ export class WebSocketManager {
   getIO(): Server {
     return this.io;
   }
+
+  getStats(): { connectedClients: number; status: string } {
+    return {
+      connectedClients: this.connectedClients,
+      status: 'running',
+    };
+  }
+}
+
+// Singleton accessor for use from health routes, avoiding circular imports
+export function getWebSocketManager(): WebSocketManager | null {
+  return wsManagerInstance;
 }
