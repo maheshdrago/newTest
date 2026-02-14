@@ -352,3 +352,17 @@ npx turbo dev
 
 - **buildcraft-net** — Main network connecting all services
 - **buildcraft-sandbox** — Internal-only network for sandbox containers (no external access)
+
+## Detailed Documentation
+
+This document provides a high-level overview. For deep dives into specific areas, see:
+
+| Document | Description |
+|----------|-------------|
+| [API Reference](./API.md) | Complete REST API docs — every endpoint, request/response schemas, error codes, rate limits, WebSocket events |
+| [Database Schema](./DATABASE.md) | All tables, columns, indexes, migrations, repository pattern, and data access methods |
+| [Services & Business Logic](./SERVICES.md) | Every service class, method signatures, dependencies, flows, and enterprise patterns (circuit breaker, retry, CQRS, rate limiter) |
+| [Infrastructure](./INFRASTRUCTURE.md) | Docker Compose, Dockerfiles, BullMQ queues, workers, Redis event bus, Socket.IO, S3 storage, sandbox execution, Kubernetes, monitoring |
+| [Frontend](./FRONTEND.md) | Next.js pages, routing, Zustand stores, API client, WebSocket client, every component with props, styling & theme |
+| [Development Guide](./DEVELOPMENT.md) | Setup, environment variables, development workflow, database management, testing, building, code conventions, troubleshooting |
+| [Security](./SECURITY.md) | Authentication flows, session management, password security, sandbox defense-in-depth, rate limiting, audit logging, known considerations |
