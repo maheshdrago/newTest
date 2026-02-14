@@ -1,73 +1,87 @@
 import { logger } from '../../core/logger';
 import { eventBus, EventTypes } from '../../core/events';
-import { projectService } from '../project';
+import { DeploymentRepository } from '../../infrastructure/database';
+import { ProjectRepository } from '../../infrastructure/database';
+import { deploymentQueue } from '../../infrastructure/queue';
 
-interface Deployment {
-  id: string;
-  projectId: string;
-  status: 'pending' | 'building' | 'deploying' | 'deployed' | 'failed';
-  url?: string;
-  logs: string[];
-  startedAt: Date;
-  completedAt?: Date;
-}
-
-const deployments = new Map<string, Deployment>();
+const deployRepo = new DeploymentRepository();
+const projectRepo = new ProjectRepository();
 
 export class DeploymentService {
-  async deploy(projectId: string, userId: string): Promise<Deployment> {
-    const project = await projectService.getProject(projectId, userId);
-    await projectService.updateProjectStatus(projectId, 'deploying');
+  /**
+   * Queue a deployment job. Writes project files to a Docker container,
+   * builds, and runs it. The actual work happens in the deployment worker.
+   */
+  async deploy(projectId: string, userId: string) {
+    const project = await projectRepo.findById(projectId);
+    if (!project) throw new Error('Project not found');
 
-    const deployment: Deployment = {
-      id: `deploy_${Date.now().toString(36)}`,
+    await projectRepo.update(projectId, { status: 'deploying' } as any);
+
+    // Create deployment record in DB
+    const deployment = await deployRepo.create({
+      project_id: projectId,
+      version: project.current_version,
+      status: 'queued',
+      build_logs: [],
+      environment: {},
+    });
+
+    // Enqueue to BullMQ for async processing
+    await deploymentQueue.add('deploy', {
+      deploymentId: deployment.id,
       projectId,
-      status: 'pending',
-      logs: [],
-      startedAt: new Date(),
+      userId,
+      version: project.current_version,
+      environment: {
+        NODE_ENV: 'production',
+        PORT: '3000',
+      },
+    }, {
+      jobId: deployment.id,
+      attempts: 2,
+      backoff: { type: 'exponential', delay: 5000 },
+    });
+
+    eventBus.publish({
+      type: EventTypes.PROJECT_DEPLOYED,
+      payload: { projectId, deploymentId: deployment.id },
+      timestamp: new Date(),
+    });
+
+    logger.info('Deployment queued', { projectId, deploymentId: deployment.id });
+
+    return {
+      id: deployment.id,
+      status: 'queued',
+      message: 'Deployment queued. You will be notified via WebSocket when complete.',
     };
-
-    deployments.set(deployment.id, deployment);
-
-    // Simulate deployment pipeline
-    try {
-      deployment.status = 'building';
-      deployment.logs.push('Building project...');
-      await new Promise(resolve => setTimeout(resolve, 100));
-
-      deployment.status = 'deploying';
-      deployment.logs.push('Deploying to cloud...');
-      await new Promise(resolve => setTimeout(resolve, 100));
-
-      deployment.status = 'deployed';
-      deployment.url = `https://${project.name.toLowerCase().replace(/\s+/g, '-')}.buildcraft.app`;
-      deployment.completedAt = new Date();
-      deployment.logs.push(`Deployed successfully at ${deployment.url}`);
-
-      await projectService.updateProjectStatus(projectId, 'deployed');
-
-      eventBus.publish({
-        type: EventTypes.PROJECT_DEPLOYED,
-        payload: { projectId, deploymentId: deployment.id, url: deployment.url },
-        timestamp: new Date(),
-      });
-
-      logger.info('Project deployed', { projectId, deploymentId: deployment.id, url: deployment.url });
-    } catch (error) {
-      deployment.status = 'failed';
-      deployment.logs.push(`Deployment failed: ${(error as Error).message}`);
-      await projectService.updateProjectStatus(projectId, 'error');
-    }
-
-    return deployment;
   }
 
-  getDeployment(deploymentId: string): Deployment | undefined {
-    return deployments.get(deploymentId);
+  async getDeployment(deploymentId: string) {
+    return deployRepo.findById(deploymentId);
   }
 
-  getDeploymentsByProject(projectId: string): Deployment[] {
-    return Array.from(deployments.values()).filter(d => d.projectId === projectId);
+  async getDeploymentsByProject(projectId: string) {
+    return deployRepo.findByProject(projectId);
+  }
+
+  async getLiveDeployment(projectId: string) {
+    return deployRepo.findLive(projectId);
+  }
+
+  /**
+   * Rollback to a previous deployment by re-deploying that version
+   */
+  async rollback(projectId: string, userId: string, deploymentId: string) {
+    const deployment = await deployRepo.findById(deploymentId);
+    if (!deployment) throw new Error('Deployment not found');
+
+    // Restore the project to that version
+    await projectRepo.restoreSnapshot(projectId, deployment.version);
+
+    // Re-deploy
+    return this.deploy(projectId, userId);
   }
 }
 

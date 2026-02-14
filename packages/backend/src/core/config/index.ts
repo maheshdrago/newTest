@@ -51,8 +51,27 @@ const envSchema = z.object({
   
   // Storage
   STORAGE_PROVIDER: z.enum(['local', 's3']).default('local'),
-  S3_BUCKET: z.string().default(''),
+  S3_BUCKET: z.string().default('buildcraft-storage'),
   S3_REGION: z.string().default('us-east-1'),
+  S3_ENDPOINT: z.string().default(''),
+  AWS_ACCESS_KEY_ID: z.string().default(''),
+  AWS_SECRET_ACCESS_KEY: z.string().default(''),
+
+  // Database (parsed from DATABASE_URL)
+  DATABASE_HOST: z.string().default('localhost'),
+  DATABASE_PORT: z.coerce.number().default(5432),
+  DATABASE_USER: z.string().default('buildcraft'),
+  DATABASE_PASSWORD: z.string().default('buildcraft'),
+  DATABASE_NAME: z.string().default('buildcraft'),
+
+  // CORS
+  CORS_ORIGINS: z.string().default('http://localhost:3000'),
+
+  // Docker / Sandbox
+  DOCKER_HOST: z.string().default('unix:///var/run/docker.sock'),
+  SANDBOX_MAX_MEMORY: z.string().default('256m'),
+  SANDBOX_MAX_CPUS: z.string().default('0.5'),
+  SANDBOX_TIMEOUT_MS: z.coerce.number().default(300000),
 });
 
 const parsed = envSchema.safeParse(process.env);

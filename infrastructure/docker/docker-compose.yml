@@ -20,8 +20,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - buildcraft-net
 
-  # Redis Cache & Queue
+  # Redis — Cache, Pub/Sub event bus, BullMQ queue backend, Socket.IO adapter
   redis:
     image: redis:7-alpine
     container_name: buildcraft-redis
@@ -30,14 +32,55 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - buildcraft-net
 
-  # Backend API
+  # MinIO — S3-compatible object storage for project files and build artifacts
+  minio:
+    image: minio/minio:latest
+    container_name: buildcraft-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: buildcraft
+      MINIO_ROOT_PASSWORD: buildcraft-secret
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - buildcraft-net
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set buildcraft http://minio:9000 buildcraft buildcraft-secret;
+      mc mb --ignore-existing buildcraft/buildcraft-storage;
+      mc mb --ignore-existing buildcraft/buildcraft-artifacts;
+      mc anonymous set download buildcraft/buildcraft-artifacts;
+      exit 0;
+      "
+    networks:
+      - buildcraft-net
+
+  # Backend API Server
   backend:
     build:
       context: ../../
@@ -51,12 +94,29 @@ services:
       NODE_ENV: production
       BACKEND_PORT: 4000
       DATABASE_URL: postgresql://buildcraft:buildcraft@postgres:5432/buildcraft
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: buildcraft
+      DATABASE_PASSWORD: buildcraft
+      DATABASE_NAME: buildcraft
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:-change-this-in-production}
+      CORS_ORIGINS: http://localhost:3000,http://frontend:3000
+      STORAGE_PROVIDER: s3
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: buildcraft-storage
+      S3_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: buildcraft
+      AWS_SECRET_ACCESS_KEY: buildcraft-secret
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker-in-Docker for sandbox execution
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:4000/api/v1/health"]
@@ -64,6 +124,61 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    networks:
+      - buildcraft-net
+      - buildcraft-sandbox
+
+  # BullMQ Worker — processes code generation, deployment, and sandbox jobs
+  worker:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/Dockerfile.backend
+    container_name: buildcraft-worker
+    restart: unless-stopped
+    command: ["node", "dist/workers/start.js"]
+    environment:
+      NODE_ENV: production
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: buildcraft
+      DATABASE_PASSWORD: buildcraft
+      DATABASE_NAME: buildcraft
+      REDIS_URL: redis://redis:6379
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      STORAGE_PROVIDER: s3
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: buildcraft-storage
+      AWS_ACCESS_KEY_ID: buildcraft
+      AWS_SECRET_ACCESS_KEY: buildcraft-secret
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - buildcraft-net
+      - buildcraft-sandbox
+
+  # Bull Board — queue monitoring dashboard
+  bull-board:
+    image: deadly0/bull-board:latest
+    container_name: buildcraft-bull-board
+    restart: unless-stopped
+    ports:
+      - "4001:3000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      BULL_PREFIX: bull
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - buildcraft-net
 
   # Frontend
   frontend:
@@ -79,6 +194,8 @@ services:
       NEXT_PUBLIC_WS_URL: ws://backend:4000
     depends_on:
       - backend
+    networks:
+      - buildcraft-net
 
   # Prometheus Monitoring
   prometheus:
@@ -90,6 +207,8 @@ services:
     volumes:
       - ../monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
       - prometheus_data:/prometheus
+    networks:
+      - buildcraft-net
 
   # Grafana Dashboard
   grafana:
@@ -106,9 +225,19 @@ services:
       - ../monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
     depends_on:
       - prometheus
+    networks:
+      - buildcraft-net
 
 volumes:
   postgres_data:
   redis_data:
+  minio_data:
   prometheus_data:
   grafana_data:
+
+networks:
+  buildcraft-net:
+    driver: bridge
+  buildcraft-sandbox:
+    driver: bridge
+    internal: true  # Isolated network for sandbox containers — no external access

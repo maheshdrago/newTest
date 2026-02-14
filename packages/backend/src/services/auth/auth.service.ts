@@ -1,49 +1,46 @@
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { config } from '../../core/config';
-import { UnauthorizedError, ConflictError, ValidationError } from '../../core/errors';
+import { UnauthorizedError, ConflictError } from '../../core/errors';
 import { eventBus, EventTypes } from '../../core/events';
 import { logger } from '../../core/logger';
+import { UserRepository } from '../../infrastructure/database';
+import { AuditRepository } from '../../infrastructure/database';
 
-interface UserRecord {
-  id: string;
-  name: string;
-  email: string;
-  passwordHash: string;
-  role: string;
-  plan: string;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-// In-memory store for demo - replace with database repository
-const users = new Map<string, UserRecord>();
+const userRepo = new UserRepository();
+const auditRepo = new AuditRepository();
 
 export class AuthService {
   async register(name: string, email: string, password: string) {
-    const existing = Array.from(users.values()).find(u => u.email === email);
+    const existing = await userRepo.findByEmail(email);
     if (existing) {
       throw new ConflictError('User with this email already exists');
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const user: UserRecord = {
-      id: `usr_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 8)}`,
+    const user = await userRepo.create({
       name,
       email,
-      passwordHash,
-      role: 'user',
+      password_hash: passwordHash,
+      role: 'member',
       plan: 'free',
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    users.set(user.id, user);
+      preferences: {},
+    });
 
     eventBus.publish({
       type: EventTypes.USER_REGISTERED,
       payload: { userId: user.id, email: user.email },
       timestamp: new Date(),
+    });
+
+    await auditRepo.log({
+      user_id: user.id,
+      action: 'user.registered',
+      resource_type: 'user',
+      resource_id: user.id,
+      details: { email },
+      ip_address: null,
+      user_agent: null,
     });
 
     logger.info('User registered', { userId: user.id, email: user.email });
@@ -56,28 +53,38 @@ export class AuthService {
         email: user.email,
         role: user.role,
         plan: user.plan,
-        projectCount: 0,
-        lastActiveAt: new Date(),
       },
       tokens,
     };
   }
 
   async login(email: string, password: string) {
-    const user = Array.from(users.values()).find(u => u.email === email);
+    const user = await userRepo.findByEmail(email);
     if (!user) {
       throw new UnauthorizedError('Invalid email or password');
     }
 
-    const isValidPassword = await bcrypt.compare(password, user.passwordHash);
+    const isValidPassword = await bcrypt.compare(password, user.password_hash);
     if (!isValidPassword) {
       throw new UnauthorizedError('Invalid email or password');
     }
+
+    await userRepo.updateLastLogin(user.id);
 
     eventBus.publish({
       type: EventTypes.USER_LOGGED_IN,
       payload: { userId: user.id },
       timestamp: new Date(),
+    });
+
+    await auditRepo.log({
+      user_id: user.id,
+      action: 'user.login',
+      resource_type: 'user',
+      resource_id: user.id,
+      details: {},
+      ip_address: null,
+      user_agent: null,
     });
 
     const tokens = this.generateTokens(user);
@@ -88,8 +95,6 @@ export class AuthService {
         email: user.email,
         role: user.role,
         plan: user.plan,
-        projectCount: 0,
-        lastActiveAt: new Date(),
       },
       tokens,
     };
@@ -97,8 +102,8 @@ export class AuthService {
 
   async refreshToken(refreshToken: string) {
     try {
-      const payload = jwt.verify(refreshToken, config.jwt.secret) as any;
-      const user = users.get(payload.userId);
+      const payload = jwt.verify(refreshToken, config.JWT_SECRET) as any;
+      const user = await userRepo.findById(payload.userId);
       if (!user) {
         throw new UnauthorizedError('User not found');
       }
@@ -108,16 +113,16 @@ export class AuthService {
     }
   }
 
-  private generateTokens(user: UserRecord) {
+  private generateTokens(user: { id: string; email: string; role: string; name: string }) {
     const accessToken = jwt.sign(
-      { userId: user.id, email: user.email, role: user.role },
-      config.jwt.secret,
-      { expiresIn: config.jwt.expiresIn },
+      { userId: user.id, email: user.email, role: user.role, name: user.name },
+      config.JWT_SECRET,
+      { expiresIn: config.JWT_EXPIRES_IN },
     );
     const refreshToken = jwt.sign(
       { userId: user.id, type: 'refresh' },
-      config.jwt.secret,
-      { expiresIn: config.jwt.refreshExpiresIn },
+      config.JWT_SECRET,
+      { expiresIn: config.JWT_REFRESH_EXPIRES_IN },
     );
     return { accessToken, refreshToken, expiresIn: 604800 };
   }

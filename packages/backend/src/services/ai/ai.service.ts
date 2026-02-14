@@ -16,6 +16,7 @@ interface GenerationRequest {
   };
   options?: {
     model?: string;
+    provider?: string;
     temperature?: number;
     maxTokens?: number;
     stream?: boolean;
@@ -47,9 +48,9 @@ export class AIService {
   constructor() {
     this.circuitBreaker = new CircuitBreaker({
       name: 'ai-provider',
-      failureThreshold: config.circuitBreaker.failureThreshold,
-      recoveryTimeout: config.circuitBreaker.recoveryTimeout,
-      successThreshold: config.circuitBreaker.successThreshold,
+      failureThreshold: config.CB_FAILURE_THRESHOLD,
+      recoveryTimeout: config.CB_RECOVERY_TIMEOUT,
+      successThreshold: config.CB_SUCCESS_THRESHOLD,
     });
   }
 
@@ -89,89 +90,150 @@ export class AIService {
   }
 
   private async callAIProvider(generationId: string, request: GenerationRequest): Promise<GenerationResult> {
-    logger.info('Calling AI provider', {
-      generationId,
-      provider: config.ai.provider,
-      projectId: request.projectId,
-    });
+    const provider = request.options?.provider || config.AI_PROVIDER;
+    const model = request.options?.model;
+    const maxTokens = request.options?.maxTokens || 8192;
+    const temperature = request.options?.temperature || 0.7;
+
+    logger.info('Calling AI provider', { generationId, provider, projectId: request.projectId });
 
     const systemPrompt = this.buildSystemPrompt(request);
     const startTime = Date.now();
 
-    // Simulated AI response for demo purposes
-    // In production, this would call OpenAI/Anthropic API
-    const fileChanges = this.generateDemoResponse(request);
-    const duration = Date.now() - startTime;
+    let responseText: string;
+    let promptTokens = 0;
+    let completionTokens = 0;
 
-    logger.info('AI generation completed', { generationId, duration: `${duration}ms`, filesGenerated: fileChanges.length });
+    if (provider === 'anthropic') {
+      if (!config.ANTHROPIC_API_KEY) throw new AIGenerationError('Anthropic API key not configured');
+
+      const { default: Anthropic } = await import('@anthropic-ai/sdk');
+      const client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+
+      const response = await client.messages.create({
+        model: model || 'claude-sonnet-4-20250514',
+        max_tokens: maxTokens,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: request.prompt }],
+      });
+
+      responseText = response.content
+        .filter((block: any) => block.type === 'text')
+        .map((block: any) => block.text)
+        .join('');
+      promptTokens = response.usage?.input_tokens || 0;
+      completionTokens = response.usage?.output_tokens || 0;
+    } else {
+      if (!config.OPENAI_API_KEY) throw new AIGenerationError('OpenAI API key not configured');
+
+      const { default: OpenAI } = await import('openai');
+      const client = new OpenAI({ apiKey: config.OPENAI_API_KEY });
+
+      const response = await client.chat.completions.create({
+        model: model || 'gpt-4',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: request.prompt },
+        ],
+        max_tokens: maxTokens,
+        temperature,
+      });
+
+      responseText = response.choices[0]?.message?.content || '';
+      promptTokens = response.usage?.prompt_tokens || 0;
+      completionTokens = response.usage?.completion_tokens || 0;
+    }
+
+    const duration = Date.now() - startTime;
+    const fileChanges = this.parseFileChanges(responseText);
+    const totalTokens = promptTokens + completionTokens;
+    const estimatedCost = this.estimateCost(provider, model || '', promptTokens, completionTokens);
+
+    // Extract message (explanation text outside of file blocks)
+    const message = responseText
+      .replace(/=== FILE: .+? ===([\s\S]*?)=== END FILE ===/g, '')
+      .replace(/```[\s\S]*?```/g, '')
+      .trim() || `Generated ${fileChanges.length} files successfully.`;
+
+    logger.info('AI generation completed', {
+      generationId,
+      duration: `${duration}ms`,
+      filesGenerated: fileChanges.length,
+      tokensUsed: totalTokens,
+      cost: estimatedCost,
+    });
 
     return {
       id: generationId,
-      message: `Generated ${fileChanges.length} files based on your prompt. The application structure includes components, styling, and configuration.`,
+      message,
       fileChanges,
-      usage: {
-        promptTokens: systemPrompt.length / 4,
-        completionTokens: fileChanges.reduce((sum, f) => sum + f.content.length / 4, 0),
-        totalTokens: 0,
-        estimatedCost: 0,
-      },
+      usage: { promptTokens, completionTokens, totalTokens, estimatedCost },
     };
   }
 
   private buildSystemPrompt(request: GenerationRequest): string {
-    return `You are an expert full-stack developer. Generate production-ready code for a ${request.context?.projectFramework || 'react'} application.
+    const framework = request.context?.projectFramework || 'react';
+    const existingFiles = request.context?.existingFiles || [];
 
-Project: ${request.context?.projectDescription || 'No description provided'}
+    let prompt = `You are an expert full-stack developer specializing in ${framework}. Generate production-ready code.
 
-Requirements:
+OUTPUT FORMAT: Output code files using this EXACT format:
+=== FILE: path/to/file.ext ===
+<file content here>
+=== END FILE ===
+
+RULES:
+- Generate ONLY the files that need to change
 - Use TypeScript for type safety
-- Follow best practices and design patterns
+- Follow ${framework} best practices
 - Include proper error handling
-- Generate clean, maintainable code
-- Use modern framework features
+- Write clean, maintainable code
+- Use modern framework features and patterns`;
 
-User Request: ${request.prompt}
+    if (existingFiles.length > 0) {
+      prompt += `\n\nEXISTING PROJECT FILES:\n`;
+      for (const file of existingFiles.slice(0, 20)) { // Limit context to 20 files
+        prompt += `\n--- ${file.path} ---\n${file.content.slice(0, 2000)}\n`;
+      }
+    }
 
-${request.context?.existingFiles?.length ? `Existing files:\n${request.context.existingFiles.map(f => `--- ${f.path} ---\n${f.content}`).join('\n\n')}` : ''}`;
+    if (request.context?.projectDescription) {
+      prompt += `\n\nPROJECT DESCRIPTION: ${request.context.projectDescription}`;
+    }
+
+    return prompt;
   }
 
-  private generateDemoResponse(request: GenerationRequest): FileChange[] {
-    const framework = request.context?.projectFramework || 'react';
+  private parseFileChanges(text: string): FileChange[] {
     const files: FileChange[] = [];
+    const fileRegex = /=== FILE: (.+?) ===([\s\S]*?)=== END FILE ===/g;
+    let match;
 
-    if (framework === 'react' || framework === 'nextjs') {
-      files.push(
-        {
-          path: 'src/App.tsx',
-          content: `import React from 'react';\nimport { Layout } from './components/Layout';\nimport { AppProvider } from './providers/AppProvider';\n\nexport default function App() {\n  return (\n    <AppProvider>\n      <Layout>\n        <main className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">\n          <h1 className="text-4xl font-bold text-center py-12">Welcome to Your App</h1>\n        </main>\n      </Layout>\n    </AppProvider>\n  );\n}\n`,
-          action: 'create',
-          language: 'typescript',
-        },
-        {
-          path: 'src/components/Layout.tsx',
-          content: `import React from 'react';\n\ninterface LayoutProps {\n  children: React.ReactNode;\n}\n\nexport function Layout({ children }: LayoutProps) {\n  return (\n    <div className="flex flex-col min-h-screen">\n      <header className="bg-white shadow-sm border-b">\n        <nav className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">\n          <span className="text-xl font-semibold">App</span>\n        </nav>\n      </header>\n      <main className="flex-1">{children}</main>\n      <footer className="bg-gray-50 border-t py-8 text-center text-sm text-gray-500">\n        Built with BuildCraft AI\n      </footer>\n    </div>\n  );\n}\n`,
-          action: 'create',
-          language: 'typescript',
-        },
-        {
-          path: 'package.json',
-          content: JSON.stringify({
-            name: 'generated-app',
-            version: '0.1.0',
-            private: true,
-            dependencies: {
-              react: '^18.2.0',
-              'react-dom': '^18.2.0',
-              typescript: '^5.4.0',
-            },
-          }, null, 2),
-          action: 'create',
-          language: 'json',
-        },
-      );
+    while ((match = fileRegex.exec(text)) !== null) {
+      const path = match[1].trim();
+      const content = match[2].trim();
+      const ext = path.split('.').pop() || '';
+      const langMap: Record<string, string> = {
+        ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript',
+        css: 'css', html: 'html', json: 'json', md: 'markdown', py: 'python',
+        sql: 'sql', yaml: 'yaml', yml: 'yaml', sh: 'bash', vue: 'vue', svelte: 'svelte',
+      };
+      files.push({ path, content, language: langMap[ext] || ext, action: 'create' });
     }
 
     return files;
+  }
+
+  private estimateCost(provider: string, model: string, inputTokens: number, outputTokens: number): number {
+    const rates: Record<string, { input: number; output: number }> = {
+      'gpt-4': { input: 0.03 / 1000, output: 0.06 / 1000 },
+      'gpt-4-turbo': { input: 0.01 / 1000, output: 0.03 / 1000 },
+      'gpt-4o': { input: 0.005 / 1000, output: 0.015 / 1000 },
+      'claude-sonnet-4-20250514': { input: 0.003 / 1000, output: 0.015 / 1000 },
+      'claude-opus-4-20250514': { input: 0.015 / 1000, output: 0.075 / 1000 },
+    };
+    const rate = rates[model] || { input: 0.01 / 1000, output: 0.03 / 1000 };
+    return inputTokens * rate.input + outputTokens * rate.output;
   }
 
   getCircuitBreakerStatus() {

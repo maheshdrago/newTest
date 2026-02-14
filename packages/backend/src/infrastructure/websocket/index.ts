@@ -1,206 +1,180 @@
-import { WebSocketServer, WebSocket } from 'ws';
-import { Server } from 'http';
+import { Server as HttpServer } from 'http';
+import { Server, Socket } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
+import Redis from 'ioredis';
 import jwt from 'jsonwebtoken';
 import { config } from '../../core/config';
 import { logger } from '../../core/logger';
-import { collaborationService } from '../../services/collaboration';
+import { eventBus } from '../../core/events';
 
-interface AuthenticatedWebSocket extends WebSocket {
+interface AuthenticatedSocket extends Socket {
   userId?: string;
-  sessionId?: string;
-  isAlive?: boolean;
+  userName?: string;
 }
 
 export class WebSocketManager {
-  private wss: WebSocketServer | null = null;
-  private clients = new Map<string, Set<AuthenticatedWebSocket>>();
-  private heartbeatInterval: NodeJS.Timeout | null = null;
+  private io: Server;
 
-  initialize(server: Server): void {
-    this.wss = new WebSocketServer({ server, path: '/ws' });
-
-    this.wss.on('connection', (ws: AuthenticatedWebSocket, req) => {
-      this.handleConnection(ws, req);
+  constructor(httpServer: HttpServer) {
+    this.io = new Server(httpServer, {
+      cors: { origin: config.CORS_ORIGINS?.split(',') || ['http://localhost:3000'], credentials: true },
+      transports: ['websocket', 'polling'],
+      pingInterval: 25000,
+      pingTimeout: 20000,
     });
 
-    this.startHeartbeat();
-    logger.info('WebSocket server initialized');
+    this.setupRedisAdapter();
+    this.setupAuthentication();
+    this.setupEventHandlers();
+    this.setupEventBusForwarding();
   }
 
-  private handleConnection(ws: AuthenticatedWebSocket, req: any): void {
-    ws.isAlive = true;
-
-    // Authenticate via query param token
-    const url = new URL(req.url || '', `http://${req.headers.host}`);
-    const token = url.searchParams.get('token');
-
-    if (!token) {
-      ws.close(4001, 'Authentication required');
-      return;
-    }
-
+  private async setupRedisAdapter(): Promise<void> {
     try {
-      const decoded = jwt.verify(token, config.JWT_SECRET) as any;
-      ws.userId = decoded.userId;
-    } catch {
-      ws.close(4001, 'Invalid token');
-      return;
+      const pubClient = new Redis(config.REDIS_URL);
+      const subClient = pubClient.duplicate();
+
+      await Promise.all([
+        new Promise<void>((resolve, reject) => {
+          pubClient.on('ready', resolve);
+          pubClient.on('error', reject);
+        }),
+        new Promise<void>((resolve, reject) => {
+          subClient.on('ready', resolve);
+          subClient.on('error', reject);
+        }),
+      ]);
+
+      this.io.adapter(createAdapter(pubClient, subClient));
+      logger.info('Socket.IO Redis adapter connected');
+    } catch (err) {
+      logger.warn('Socket.IO Redis adapter failed, using in-memory', { error: (err as Error).message });
     }
+  }
 
-    logger.info(`WebSocket client connected`, { userId: ws.userId });
+  private setupAuthentication(): void {
+    this.io.use((socket: AuthenticatedSocket, next) => {
+      const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
+      if (!token) return next(new Error('Authentication required'));
 
-    ws.on('pong', () => { ws.isAlive = true; });
-
-    ws.on('message', (data: Buffer) => {
       try {
-        const message = JSON.parse(data.toString());
-        this.handleMessage(ws, message);
-      } catch (error) {
-        ws.send(JSON.stringify({ event: 'error', payload: { message: 'Invalid message format' } }));
+        const decoded = jwt.verify(token, config.JWT_SECRET) as { userId: string; name: string };
+        socket.userId = decoded.userId;
+        socket.userName = decoded.name;
+        next();
+      } catch (err) {
+        next(new Error('Invalid token'));
       }
     });
-
-    ws.on('close', () => {
-      if (ws.sessionId) {
-        collaborationService.leaveSession(ws.sessionId, ws.userId!);
-        this.broadcastToSession(ws.sessionId, {
-          event: 'user_left',
-          payload: { userId: ws.userId },
-          timestamp: Date.now(),
-        }, ws.userId);
-      }
-
-      // Remove from clients
-      for (const [, clients] of this.clients) {
-        clients.delete(ws);
-      }
-      logger.info(`WebSocket client disconnected`, { userId: ws.userId });
-    });
   }
 
-  private handleMessage(ws: AuthenticatedWebSocket, message: any): void {
-    switch (message.event) {
-      case 'join_session':
-        this.handleJoinSession(ws, message.payload);
-        break;
-      case 'leave_session':
-        this.handleLeaveSession(ws);
-        break;
-      case 'cursor_move':
-        this.handleCursorMove(ws, message.payload);
-        break;
-      case 'file_change':
-        this.handleFileChange(ws, message.payload);
-        break;
-      default:
-        ws.send(JSON.stringify({ event: 'error', payload: { message: `Unknown event: ${message.event}` } }));
-    }
-  }
+  private setupEventHandlers(): void {
+    this.io.on('connection', (socket: AuthenticatedSocket) => {
+      logger.info('Client connected', { socketId: socket.id, userId: socket.userId });
 
-  private handleJoinSession(ws: AuthenticatedWebSocket, payload: any): void {
-    const { sessionId, projectId, userName } = payload;
-
-    if (projectId) {
-      const session = collaborationService.createSession(projectId, ws.userId!, userName || 'Anonymous');
-      ws.sessionId = session.id;
-    } else if (sessionId) {
-      collaborationService.joinSession(sessionId, ws.userId!, payload.userName || 'Anonymous');
-      ws.sessionId = sessionId;
-    }
-
-    if (ws.sessionId) {
-      if (!this.clients.has(ws.sessionId)) {
-        this.clients.set(ws.sessionId, new Set());
-      }
-      this.clients.get(ws.sessionId)!.add(ws);
-
-      ws.send(JSON.stringify({
-        event: 'session_joined',
-        payload: { sessionId: ws.sessionId },
-        timestamp: Date.now(),
-      }));
-
-      this.broadcastToSession(ws.sessionId, {
-        event: 'user_joined',
-        payload: { userId: ws.userId, userName: payload.userName },
-        timestamp: Date.now(),
-      }, ws.userId);
-    }
-  }
-
-  private handleLeaveSession(ws: AuthenticatedWebSocket): void {
-    if (ws.sessionId) {
-      collaborationService.leaveSession(ws.sessionId, ws.userId!);
-      this.clients.get(ws.sessionId)?.delete(ws);
-      ws.sessionId = undefined;
-    }
-  }
-
-  private handleCursorMove(ws: AuthenticatedWebSocket, payload: any): void {
-    if (!ws.sessionId) return;
-    collaborationService.updateCursor(ws.sessionId, ws.userId!, payload.cursor);
-    this.broadcastToSession(ws.sessionId, {
-      event: 'cursor_move',
-      payload: { userId: ws.userId, cursor: payload.cursor },
-      timestamp: Date.now(),
-    }, ws.userId);
-  }
-
-  private handleFileChange(ws: AuthenticatedWebSocket, payload: any): void {
-    if (!ws.sessionId) return;
-    this.broadcastToSession(ws.sessionId, {
-      event: 'file_change',
-      payload: { userId: ws.userId, ...payload },
-      timestamp: Date.now(),
-    }, ws.userId);
-  }
-
-  broadcastToSession(sessionId: string, message: any, excludeUserId?: string): void {
-    const clients = this.clients.get(sessionId);
-    if (!clients) return;
-
-    const data = JSON.stringify(message);
-    for (const client of clients) {
-      if (client.readyState === WebSocket.OPEN && client.userId !== excludeUserId) {
-        client.send(data);
-      }
-    }
-  }
-
-  sendToUser(userId: string, message: any): void {
-    for (const [, clients] of this.clients) {
-      for (const client of clients) {
-        if (client.userId === userId && client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify(message));
-        }
-      }
-    }
-  }
-
-  private startHeartbeat(): void {
-    this.heartbeatInterval = setInterval(() => {
-      this.wss?.clients.forEach((ws: WebSocket) => {
-        const authWs = ws as AuthenticatedWebSocket;
-        if (!authWs.isAlive) {
-          return authWs.terminate();
-        }
-        authWs.isAlive = false;
-        authWs.ping();
+      // Join project room
+      socket.on('join-project', async (projectId: string) => {
+        await socket.join(`project:${projectId}`);
+        // Broadcast presence to room
+        this.io.to(`project:${projectId}`).emit('user-joined', {
+          userId: socket.userId,
+          userName: socket.userName,
+          socketId: socket.id,
+          timestamp: new Date(),
+        });
+        logger.info('User joined project room', { userId: socket.userId, projectId });
       });
-    }, config.WS_HEARTBEAT_INTERVAL);
+
+      // Leave project room
+      socket.on('leave-project', async (projectId: string) => {
+        await socket.leave(`project:${projectId}`);
+        this.io.to(`project:${projectId}`).emit('user-left', {
+          userId: socket.userId,
+          timestamp: new Date(),
+        });
+      });
+
+      // File change broadcast (operational transform-ready)
+      socket.on('file-change', (data: { projectId: string; path: string; content: string; cursorPosition?: any }) => {
+        socket.to(`project:${data.projectId}`).emit('file-changed', {
+          ...data,
+          userId: socket.userId,
+          userName: socket.userName,
+          timestamp: new Date(),
+        });
+      });
+
+      // Cursor position broadcast
+      socket.on('cursor-move', (data: { projectId: string; path: string; position: { line: number; column: number } }) => {
+        socket.to(`project:${data.projectId}`).emit('cursor-moved', {
+          ...data,
+          userId: socket.userId,
+          userName: socket.userName,
+        });
+      });
+
+      // Chat message in project
+      socket.on('chat-message', (data: { projectId: string; content: string }) => {
+        this.io.to(`project:${data.projectId}`).emit('chat-message', {
+          id: `msg_${Date.now()}_${socket.id}`,
+          content: data.content,
+          userId: socket.userId,
+          userName: socket.userName,
+          timestamp: new Date(),
+        });
+      });
+
+      // Disconnect
+      socket.on('disconnect', (reason) => {
+        logger.info('Client disconnected', { socketId: socket.id, userId: socket.userId, reason });
+        // Notify all rooms this socket was in
+        socket.rooms.forEach((room) => {
+          if (room.startsWith('project:')) {
+            this.io.to(room).emit('user-left', { userId: socket.userId, timestamp: new Date() });
+          }
+        });
+      });
+    });
   }
 
-  shutdown(): void {
-    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-    this.wss?.close();
+  // Forward relevant event bus events to WebSocket clients
+  private setupEventBusForwarding(): void {
+    eventBus.subscribe('generation.started', (event) => {
+      this.io.to(`project:${event.payload.projectId}`).emit('generation-started', event.payload);
+    });
+
+    eventBus.subscribe('generation.completed', (event) => {
+      this.io.to(`project:${event.payload.projectId}`).emit('generation-completed', event.payload);
+    });
+
+    eventBus.subscribe('generation.failed', (event) => {
+      this.io.to(`project:${event.payload.projectId}`).emit('generation-failed', event.payload);
+    });
+
+    eventBus.subscribe('deployment.completed', (event) => {
+      this.io.to(`project:${event.payload.projectId}`).emit('deployment-completed', event.payload);
+    });
+
+    eventBus.subscribe('deployment.failed', (event) => {
+      this.io.to(`project:${event.payload.projectId}`).emit('deployment-failed', event.payload);
+    });
+
+    eventBus.subscribe('sandbox.ready', (event) => {
+      this.io.to(`project:${event.payload.projectId}`).emit('sandbox-ready', event.payload);
+    });
   }
 
-  getStats() {
-    return {
-      totalConnections: this.wss?.clients.size || 0,
-      activeSessions: this.clients.size,
-    };
+  // Emit to specific project room
+  emitToProject(projectId: string, event: string, data: any): void {
+    this.io.to(`project:${projectId}`).emit(event, data);
+  }
+
+  // Emit to specific user
+  emitToUser(userId: string, event: string, data: any): void {
+    this.io.to(`user:${userId}`).emit(event, data);
+  }
+
+  getIO(): Server {
+    return this.io;
   }
 }
-
-export const wsManager = new WebSocketManager();
