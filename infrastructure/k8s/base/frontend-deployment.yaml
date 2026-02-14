@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildcraft-frontend
+  namespace: buildcraft
+  labels:
+    app: buildcraft
+    component: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: buildcraft
+      component: frontend
+  template:
+    metadata:
+      labels:
+        app: buildcraft
+        component: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: buildcraft/frontend:latest
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildcraft-frontend
+  namespace: buildcraft
+spec:
+  selector:
+    app: buildcraft
+    component: frontend
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: buildcraft-ingress
+  namespace: buildcraft
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/websocket-services: "buildcraft-backend"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - buildcraft.app
+        - api.buildcraft.app
+      secretName: buildcraft-tls
+  rules:
+    - host: buildcraft.app
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: buildcraft-frontend
+                port:
+                  number: 3000
+    - host: api.buildcraft.app
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: buildcraft-backend
+                port:
+                  number: 4000
