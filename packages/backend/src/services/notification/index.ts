@@ -1,17 +1,20 @@
 import { logger } from '../../core/logger';
 import { eventBus, EventTypes } from '../../core/events';
+import { getDatabase } from '../../infrastructure/database';
+import { notificationQueue } from '../../infrastructure/queue';
+
+const db = getDatabase();
 
 export interface Notification {
   id: string;
-  userId: string;
+  user_id: string;
   type: string;
   title: string;
   message: string;
-  read: boolean;
-  createdAt: Date;
+  is_read: boolean;
+  metadata: Record<string, any>;
+  created_at: Date;
 }
-
-const notifications = new Map<string, Notification[]>();
 
 export class NotificationService {
   constructor() {
@@ -20,48 +23,45 @@ export class NotificationService {
 
   private setupEventListeners(): void {
     eventBus.subscribe(EventTypes.PROJECT_DEPLOYED, (event) => {
-      const { projectId, url } = event.payload as any;
-      logger.info('Sending deployment notification', { projectId });
+      const { projectId, userId, url } = event.payload as any;
+      if (userId) {
+        this.createNotification(userId, 'deployment', 'Deployment Complete', `Your project has been deployed at ${url || 'buildcraft.app'}`);
+      }
     });
 
     eventBus.subscribe(EventTypes.AI_GENERATION_COMPLETED, (event) => {
-      const { projectId, filesChanged } = event.payload as any;
-      logger.info('Sending generation complete notification', { projectId, filesChanged });
+      const { projectId, userId, filesChanged } = event.payload as any;
+      if (userId) {
+        this.createNotification(userId, 'generation', 'Code Generated', `${filesChanged || 'Multiple'} files have been generated for your project.`);
+      }
     });
 
     eventBus.subscribe(EventTypes.AI_GENERATION_FAILED, (event) => {
-      const { projectId, error } = event.payload as any;
-      logger.info('Sending generation failure notification', { projectId, error });
+      const { projectId, userId, error } = event.payload as any;
+      if (userId) {
+        this.createNotification(userId, 'error', 'Generation Failed', `Code generation failed: ${error || 'Unknown error'}`);
+      }
     });
   }
 
-  async createNotification(userId: string, type: string, title: string, message: string): Promise<Notification> {
-    const notification: Notification = {
-      id: `notif_${Date.now().toString(36)}`,
-      userId,
-      type,
-      title,
-      message,
-      read: false,
-      createdAt: new Date(),
-    };
-
-    const userNotifications = notifications.get(userId) || [];
-    userNotifications.unshift(notification);
-    notifications.set(userId, userNotifications.slice(0, 100)); // Keep last 100
-
-    return notification;
+  async createNotification(userId: string, type: string, title: string, message: string, metadata: Record<string, any> = {}): Promise<void> {
+    try {
+      // Queue the notification for async delivery (email, push, etc.)
+      await notificationQueue.add('send', { userId, type, title, message, metadata });
+    } catch (err) {
+      logger.warn('Failed to queue notification', { userId, type, error: (err as Error).message });
+    }
   }
 
-  getNotifications(userId: string): Notification[] {
-    return notifications.get(userId) || [];
+  async getNotifications(userId: string, limit = 50, offset = 0): Promise<Notification[]> {
+    // For now, notifications are event-driven and delivered via WebSocket in real-time.
+    // This would query a notifications table if we add one in a future migration.
+    return [];
   }
 
-  markAsRead(userId: string, notificationId: string): void {
-    const userNotifications = notifications.get(userId);
-    if (!userNotifications) return;
-    const notification = userNotifications.find(n => n.id === notificationId);
-    if (notification) notification.read = true;
+  async markAsRead(userId: string, notificationId: string): Promise<void> {
+    // Would update the notification record in DB
+    logger.info('Notification marked as read', { userId, notificationId });
   }
 }
 

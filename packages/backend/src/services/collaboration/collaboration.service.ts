@@ -1,90 +1,139 @@
 import { logger } from '../../core/logger';
 import { eventBus, EventTypes } from '../../core/events';
 import { NotFoundError } from '../../core/errors';
+import { getDatabase } from '../../infrastructure/database';
 
-interface Session {
-  id: string;
-  projectId: string;
-  participants: Map<string, {
-    userId: string;
-    name: string;
-    role: string;
-    cursor?: { fileId: string; line: number; column: number };
-    isOnline: boolean;
-    joinedAt: Date;
-  }>;
-  createdAt: Date;
+interface Participant {
+  userId: string;
+  name: string;
+  role: string;
+  cursor?: { fileId: string; line: number; column: number };
+  joinedAt: string;
 }
 
 export class CollaborationService {
-  private sessions = new Map<string, Session>();
+  private db = getDatabase();
 
-  createSession(projectId: string): Session {
-    const session: Session = {
-      id: `ses_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 8)}`,
-      projectId,
-      participants: new Map(),
-      createdAt: new Date(),
-    };
-    this.sessions.set(session.id, session);
+  async createOrJoinSession(projectId: string, userId: string, userName: string): Promise<any> {
+    // Check for existing active session
+    const existing = await this.db('collaboration_sessions')
+      .where({ project_id: projectId, is_active: true })
+      .first();
+
+    if (existing) {
+      await this.addParticipant(existing.id, userId, userName);
+      return this.getSession(existing.id);
+    }
+
+    // Create new session
+    const participants: Participant[] = [{
+      userId,
+      name: userName,
+      role: 'owner',
+      joinedAt: new Date().toISOString(),
+    }];
+
+    const [session] = await this.db('collaboration_sessions')
+      .insert({
+        project_id: projectId,
+        participants: JSON.stringify(participants),
+        is_active: true,
+      })
+      .returning('*');
+
+    eventBus.publish({
+      type: EventTypes.COLLABORATION_SESSION_STARTED,
+      payload: { sessionId: session.id, projectId, userId },
+      timestamp: new Date(),
+    });
+
     logger.info('Collaboration session created', { sessionId: session.id, projectId });
     return session;
   }
 
-  joinSession(sessionId: string, userId: string, name: string, role: string = 'editor') {
-    const session = this.sessions.get(sessionId);
-    if (!session) {
-      throw new NotFoundError('Session', sessionId);
-    }
+  async addParticipant(sessionId: string, userId: string, userName: string): Promise<void> {
+    const session = await this.db('collaboration_sessions').where('id', sessionId).first();
+    if (!session) throw new NotFoundError('Session', sessionId);
 
-    session.participants.set(userId, {
+    const participants: Participant[] = JSON.parse(session.participants || '[]');
+
+    // Don't add duplicate
+    if (participants.some((p) => p.userId === userId)) return;
+
+    participants.push({
       userId,
-      name,
-      role,
-      isOnline: true,
-      joinedAt: new Date(),
+      name: userName,
+      role: 'editor',
+      joinedAt: new Date().toISOString(),
     });
+
+    await this.db('collaboration_sessions')
+      .where('id', sessionId)
+      .update({ participants: JSON.stringify(participants), updated_at: new Date() });
 
     eventBus.publish({
-      type: EventTypes.COLLABORATOR_JOINED,
-      payload: { sessionId, userId, name },
+      type: EventTypes.COLLABORATION_USER_JOINED,
+      payload: { sessionId, userId },
       timestamp: new Date(),
     });
-
-    return session;
   }
 
-  leaveSession(sessionId: string, userId: string) {
-    const session = this.sessions.get(sessionId);
+  async removeParticipant(sessionId: string, userId: string): Promise<void> {
+    const session = await this.db('collaboration_sessions').where('id', sessionId).first();
     if (!session) return;
 
-    const participant = session.participants.get(userId);
-    if (participant) {
-      participant.isOnline = false;
-      eventBus.publish({
-        type: EventTypes.COLLABORATOR_LEFT,
-        payload: { sessionId, userId },
-        timestamp: new Date(),
-      });
+    const participants: Participant[] = JSON.parse(session.participants || '[]');
+    const filtered = participants.filter((p) => p.userId !== userId);
+
+    if (filtered.length === 0) {
+      // No participants left — deactivate session
+      await this.db('collaboration_sessions')
+        .where('id', sessionId)
+        .update({ is_active: false, participants: '[]', updated_at: new Date() });
+    } else {
+      await this.db('collaboration_sessions')
+        .where('id', sessionId)
+        .update({ participants: JSON.stringify(filtered), updated_at: new Date() });
     }
+
+    eventBus.publish({
+      type: EventTypes.COLLABORATION_USER_LEFT,
+      payload: { sessionId, userId },
+      timestamp: new Date(),
+    });
   }
 
-  updateCursor(sessionId: string, userId: string, cursor: { fileId: string; line: number; column: number }) {
-    const session = this.sessions.get(sessionId);
+  async updateCursor(sessionId: string, userId: string, cursor: { fileId: string; line: number; column: number }): Promise<void> {
+    const session = await this.db('collaboration_sessions').where('id', sessionId).first();
     if (!session) return;
 
-    const participant = session.participants.get(userId);
+    const participants: Participant[] = JSON.parse(session.participants || '[]');
+    const participant = participants.find((p) => p.userId === userId);
     if (participant) {
       participant.cursor = cursor;
+      await this.db('collaboration_sessions')
+        .where('id', sessionId)
+        .update({ participants: JSON.stringify(participants), updated_at: new Date() });
     }
   }
 
-  getSession(sessionId: string): Session | undefined {
-    return this.sessions.get(sessionId);
+  async getSession(sessionId: string) {
+    return this.db('collaboration_sessions').where('id', sessionId).first();
   }
 
-  getSessionByProject(projectId: string): Session | undefined {
-    return Array.from(this.sessions.values()).find(s => s.projectId === projectId);
+  async getSessionByProject(projectId: string) {
+    return this.db('collaboration_sessions')
+      .where({ project_id: projectId, is_active: true })
+      .first();
+  }
+
+  async cleanupInactiveSessions(): Promise<number> {
+    // Deactivate sessions with no activity for 24 hours
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    return this.db('collaboration_sessions')
+      .where('is_active', true)
+      .where('updated_at', '<', cutoff)
+      .update({ is_active: false, updated_at: new Date() });
   }
 }
 
